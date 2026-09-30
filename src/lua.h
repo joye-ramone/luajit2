@@ -235,6 +235,43 @@ LUA_API int  (lua_status) (lua_State *L);
 
 LUA_API int (lua_gc) (lua_State *L, int what, int data);
 
+/* -- OGSR extensions ------------------------------------------------------ */
+
+/* Userdata whose __gc is never called. Cheaper for the GC: it isn't walked
+** when separating userdata to be finalized. */
+LUA_API void *(lua_newuserdata_nogc) (lua_State *L, size_t sz);
+
+/* Stats of the last LUA_GCTIMEOUT call. Times are in ns. */
+typedef struct lua_GCStats {
+  unsigned long long total_ns;		/* Whole call. */
+  unsigned long long max_batch_ns;	/* Longest run of steps between two clock reads. */
+  unsigned long long atomic_ns;		/* Atomic phase, 0 if it didn't run. */
+  unsigned long long atomic_remark_ns;	/* Open upvalues + leftover gray objects. */
+  unsigned long long atomic_roots_ns;	/* Weak tables, running thread, GC roots. */
+  unsigned long long atomic_grayagain_ns;	/* Threads and tables hit by write barriers. */
+  unsigned long long atomic_udata_ns;	/* Separate and mark userdata to finalize. */
+  unsigned long long atomic_clearweak_ns;	/* Clear weak tables. */
+  unsigned long long udata_walked;	/* Userdata walked by separateudata. */
+  unsigned long long udata_prescanned;	/* Userdata set aside before the atomic phase. */
+  unsigned int steps;			/* gc_onestep calls. */
+  unsigned int finalized;		/* __gc calls. */
+  unsigned int max_batch_steps;
+  int max_batch_state;			/* GC state at the start of the longest run. */
+  int start_state, end_state;		/* 0 pause, 1 propagate, 2 atomic, 3 sweepstring, 4 sweep, 5 finalize. */
+} lua_GCStats;
+
+LUA_API const lua_GCStats *(lua_gcstats) (lua_State *L);
+
+/* Number of __gc calls (udata and cdata) since the state was created. */
+LUA_API unsigned long long (lua_gcfinalizedtotal) (lua_State *L);
+
+/* Calls f for every userdata on the heap (debug). f must not call into Lua.
+** Userdata pending finalization aren't visited, run a full GC first. */
+typedef void (*lua_UdataVisitor) (void *ctx, void *data, size_t len, const void *mt);
+LUA_API void (lua_gcforeachudata) (lua_State *L, lua_UdataVisitor f, void *ctx);
+
+/* -- End of OGSR extensions ----------------------------------------------- */
+
 
 /*
 ** miscellaneous functions

@@ -59,6 +59,10 @@ LJ_FUNCA void LJ_FASTCALL lj_gc_step_fixtop(lua_State *L);
 #if LJ_HASJIT
 LJ_FUNC int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps);
 #endif
+#if LJ_TARGET_WINDOWS || LJ_TARGET_POSIX
+LJ_FUNC int lj_gc_step_timeout(lua_State *L, uint64_t timeout_ns);  /* OGSR */
+#endif
+LJ_FUNC void lj_gc_foreach_udata(global_State *g, lua_UdataVisitor f, void *ctx);  /* OGSR */
 LJ_FUNC void lj_gc_fullgc(lua_State *L);
 
 /* GC check: drive collector forward if the GC threshold has been reached. */

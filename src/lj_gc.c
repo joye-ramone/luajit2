@@ -29,6 +29,46 @@
 #include "lj_vm.h"
 #include "lj_vmevent.h"
 
+/* -- OGSR: timer for the time-budgeted GC and GC stats -------------------- */
+
+#if LJ_TARGET_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+static uint64_t gc_time_ns(void)
+{
+  static uint64_t freq = 0;
+  LARGE_INTEGER pc;
+  uint64_t t;
+  if (LJ_UNLIKELY(freq == 0)) {
+    LARGE_INTEGER pf;
+    QueryPerformanceFrequency(&pf);
+    freq = (uint64_t)pf.QuadPart;
+  }
+  QueryPerformanceCounter(&pc);
+  t = (uint64_t)pc.QuadPart;
+  return (t / freq) * 1000000000ULL + ((t % freq) * 1000000000ULL) / freq;
+}
+#elif LJ_TARGET_POSIX
+#include <time.h>
+
+static uint64_t gc_time_ns(void)
+{
+  struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
+  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+  return 1000000000ULL * ts.tv_sec + ts.tv_nsec;
+}
+#else
+static uint64_t gc_time_ns(void)
+{
+  return 0;
+}
+#endif
+
 #define GCSTEPSIZE	1024u
 #define GCSWEEPMAX	40
 #define GCSWEEPCOST	10
@@ -98,6 +138,8 @@ static void gc_mark_gcroot(global_State *g)
       gc_markobj(g, gcref(g->gcroot[i]));
 }
 
+static void gc_udscan_start(global_State *g);  /* OGSR: userdata pre-scan. */
+
 /* Start a GC cycle and mark the root set. */
 static void gc_mark_start(global_State *g)
 {
@@ -109,6 +151,7 @@ static void gc_mark_start(global_State *g)
   gc_markobj(g, vmthread(g));
   gc_marktv(g, &g->registrytv);
   gc_mark_gcroot(g);
+  gc_udscan_start(g);  /* OGSR: userdata pre-scan. */
   g->gc.state = GCSpropagate;
 }
 
@@ -138,13 +181,97 @@ static void gc_mark_mmudata(global_State *g)
   }
 }
 
+/* -- OGSR: userdata pre-scan --------------------------------------------- */
+
+/* Walking the whole main userdata list in the atomic phase costs a cache miss
+** per userdata and can't be split. But a userdata that is already black can't
+** turn white again before the sweep, and a finalized one is always skipped.
+** So these are moved to a side list incrementally at the end of the mark
+** phase, and the atomic phase only walks the rest. The side list is spliced
+** back right after that walk, so sweep and finalization never see it.
+**
+** Order matters: userdata are finalized newest first (lua_close relies on it,
+** e.g. luabind instances must be finalized before their class_rep). The main
+** list is newest first, the side list keeps the order of the moved userdata,
+** and it's spliced back at the end of the main list: everything left on the
+** main list is either newer (created during the cycle) or dead.
+*/
+#define GCUDSCANMAX	64	/* Max. userdata pre-scanned per step. */
+
+/* Reset the pre-scan for a new GC cycle. */
+static void gc_udscan_start(global_State *g)
+{
+  setmref(g->gc.udscan, &mainthread(g)->nextgc);
+  g->gc.udscandone = 0;
+}
+
+/* Splice the pre-scanned userdata back at endp, the terminating link of the
+** main userdata list.
+*/
+static void gc_udscan_rejoin_at(global_State *g, GCRef *endp)
+{
+  lj_assertG(gcref(*endp) == NULL, "not the end of the userdata list");
+  if (gcref(g->gc.udscanned)) {
+    setgcrefr(*endp, g->gc.udscanned);
+    setgcrefnull(g->gc.udscanned);
+    setgcrefnull(g->gc.udscannedtail);
+  }
+  g->gc.udscandone = 1;  /* Nothing left to pre-scan in this cycle. */
+}
+
+/* Splice the pre-scanned userdata back into the main userdata list. */
+static void gc_udscan_rejoin(global_State *g)
+{
+  GCRef *p = &mainthread(g)->nextgc;
+  if (gcref(g->gc.udscanned)) {
+    GCobj *o;
+    while ((o = gcref(*p)) != NULL)  /* Find the end of the main list. */
+      p = &o->gch.nextgc;
+  }
+  gc_udscan_rejoin_at(g, p);
+}
+
+/* Pre-scan a limited number of userdata. */
+static void gc_udscan_step(global_State *g)
+{
+  GCRef *p = mref(g->gc.udscan, GCRef);
+  GCobj *o;
+  MSize lim = GCUDSCANMAX;
+  while ((o = gcref(*p)) != NULL) {
+    if (lim-- == 0) {
+      setmref(g->gc.udscan, p);
+      return;
+    }
+    if (!iswhite(o) || isfinalized(gco2ud(o))) {  /* Can't need finalization. */
+      GCobj *tail = gcref(g->gc.udscannedtail);
+      *p = o->gch.nextgc;  /* Unlink and append to the pre-scanned list. */
+      setgcrefnull(o->gch.nextgc);
+      if (tail)
+	setgcref(tail->gch.nextgc, o);
+      else
+	setgcref(g->gc.udscanned, o);
+      setgcref(g->gc.udscannedtail, o);
+      g->gc.stats.udata_prescanned++;
+    } else {
+      p = &o->gch.nextgc;  /* Still white, leave it for the atomic phase. */
+    }
+  }
+  setmref(g->gc.udscan, p);
+  g->gc.udscandone = 1;
+}
+
+/* -- End of OGSR userdata pre-scan ---------------------------------------- */
+
 /* Separate userdata objects to be finalized to mmudata list. */
 size_t lj_gc_separateudata(global_State *g, int all)
 {
   size_t m = 0;
   GCRef *p = &mainthread(g)->nextgc;
   GCobj *o;
+  if (all)
+    gc_udscan_rejoin(g);  /* OGSR: need to walk every userdata. */
   while ((o = gcref(*p)) != NULL) {
+    g->gc.stats.udata_walked++;  /* OGSR: stats. */
     if (!(iswhite(o) || all) || isfinalized(gco2ud(o))) {
       p = &o->gch.nextgc;  /* Nothing to do. */
     } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
@@ -165,6 +292,7 @@ size_t lj_gc_separateudata(global_State *g, int all)
       }
     }
   }
+  gc_udscan_rejoin_at(g, p);  /* OGSR: put back pre-scanned userdata, p is the end of the list now. */
   return m;
 }
 
@@ -510,6 +638,7 @@ static void gc_call_finalizer(global_State *g, lua_State *L,
   int errcode;
   lua_State *VL = vmthread(g);
   TValue *top;
+  g->gc.finalized_total++;  /* OGSR: stats. */
   lj_trace_abort(g);
   hook_entergc(g);  /* Disable hooks and new traces during __gc. */
   if (LJ_HASPROFILE && (oldh & HOOK_PROFILE)) lj_dispatch_update(g, 0);
@@ -617,13 +746,20 @@ void lj_gc_freeall(global_State *g)
 
 /* -- Collector ----------------------------------------------------------- */
 
+/* OGSR: time a part of the atomic phase into lua_GCStats. */
+#define gc_stat_lap(field) \
+  { uint64_t t1_ = gc_time_ns(); st->field = t1_ - t0; t0 = t1_; }
+
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
 static void atomic(global_State *g, lua_State *L)
 {
   size_t udsize;
+  lua_GCStats *st = &g->gc.stats;  /* OGSR: stats. */
+  uint64_t t0 = gc_time_ns();  /* OGSR: stats. */
 
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
+  gc_stat_lap(atomic_remark_ns);  /* OGSR: stats. */
 
   setgcrefr(g->gc.gray, g->gc.weak);  /* Empty the list of weak tables. */
   setgcrefnull(g->gc.weak);
@@ -636,17 +772,21 @@ static void atomic(global_State *g, lua_State *L)
   gc_traverse_curtrace(g);  /* Traverse current trace. */
   gc_mark_gcroot(g);  /* Mark GC roots (again). */
   gc_propagate_gray(g);  /* Propagate all of the above. */
+  gc_stat_lap(atomic_roots_ns);  /* OGSR: stats. */
 
   setgcrefr(g->gc.gray, g->gc.grayagain);  /* Empty the 2nd chance list. */
   setgcrefnull(g->gc.grayagain);
   gc_propagate_gray(g);  /* Propagate it. */
+  gc_stat_lap(atomic_grayagain_ns);  /* OGSR: stats. */
 
   udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
   gc_mark_mmudata(g);  /* Mark them. */
   udsize += gc_propagate_gray(g);  /* And propagate the marks. */
+  gc_stat_lap(atomic_udata_ns);  /* OGSR: stats. */
 
   /* All marking done, clear weak tables. */
   gc_clearweak(g, gcref(g->gc.weak));
+  gc_stat_lap(atomic_clearweak_ns);  /* OGSR: stats. */
 
   lj_buf_shrink(L, &g->tmpbuf);  /* Shrink temp buffer. */
 
@@ -668,6 +808,10 @@ static size_t gc_onestep(lua_State *L)
   case GCSpropagate:
     if (gcref(g->gc.gray) != NULL)
       return propagatemark(g);  /* Propagate one gray object. */
+    if (!g->gc.udscandone) {  /* OGSR: pre-scan userdata for the atomic phase. */
+      gc_udscan_step(g);
+      return GCUDSCANMAX*GCSWEEPCOST;
+    }
     g->gc.state = GCSatomic;  /* End of mark phase. */
     return 0;
   case GCSatomic:
@@ -777,6 +921,106 @@ int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps)
 }
 #endif
 
+/* -- OGSR: time-budgeted collector (LUA_GCTIMEOUT) ---------------------- */
+
+#if LJ_TARGET_WINDOWS || LJ_TARGET_POSIX
+
+#define GCTIMECHECKSTEPS	16	/* Max. GC steps between clock reads. */
+#define GCTIMECHECKCOST		(GCSTEPSIZE*8)	/* Max. GC work between clock reads. */
+
+/* Run incremental GC steps until the time budget is used up.
+** The atomic phase can't be split, so it's deferred to the start of the next
+** call if the remaining budget is smaller than the last measured atomic phase.
+** Doesn't start a new cycle after finishing one. Fills g->gc.stats.
+** Returns 1 if a GC cycle finished, 0 otherwise.
+*/
+int lj_gc_step_timeout(lua_State *L, uint64_t timeout_ns)
+{
+  global_State *g = G(L);
+  lua_GCStats *st = &g->gc.stats;
+  int32_t ostate = g->vmstate;
+  uint64_t start = gc_time_ns(), now = start, batch = start;
+  uint64_t deadline = start + timeout_ns;
+  size_t cost = 0;
+  MSize n = 0;
+  int worked = 0, res = 0, bstate = g->gc.state;
+  memset(st, 0, sizeof(*st));
+  st->start_state = g->gc.state;
+  setvmstate(g, GC);
+  for (;;) {
+    if (g->gc.state == GCSatomic) {
+      uint64_t t = gc_time_ns();
+      if (worked && t + g->gc.atomic_ns > deadline)
+	break;  /* Not enough budget left, defer the atomic phase. */
+      if (gc_onestep(L) >= (size_t)LJ_MAX_MEM)
+	break;
+      now = gc_time_ns();
+      g->gc.atomic_ns = now - t;
+      st->atomic_ns = g->gc.atomic_ns;
+      st->steps++;
+      batch = now;
+      bstate = g->gc.state;
+      cost = 0;
+      n = 0;
+    } else {
+      size_t c;
+      if (g->gc.state == GCSfinalize && gcref(g->gc.mmudata) != NULL)
+	st->finalized++;
+      c = gc_onestep(L);
+      if (c >= (size_t)LJ_MAX_MEM)
+	break;
+      cost += c;
+      n++;
+      st->steps++;
+    }
+    worked = 1;
+    if (g->gc.state == GCSpause) {  /* Finished a GC cycle. */
+      g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
+      res = 1;
+      break;
+    }
+    /* Finalizers run arbitrary code, so check the clock after each one. */
+    if (n >= GCTIMECHECKSTEPS || cost >= GCTIMECHECKCOST || g->gc.state == GCSfinalize) {
+      now = gc_time_ns();
+      if (now - batch > st->max_batch_ns) {
+	st->max_batch_ns = now - batch;
+	st->max_batch_steps = n;
+	st->max_batch_state = bstate;
+      }
+      batch = now;
+      bstate = g->gc.state;
+      cost = 0;
+      n = 0;
+    }
+    if (now >= deadline)
+      break;
+  }
+  now = gc_time_ns();
+  if (n && now - batch > st->max_batch_ns) {
+    st->max_batch_ns = now - batch;
+    st->max_batch_steps = n;
+    st->max_batch_state = bstate;
+  }
+  st->total_ns = now - start;
+  st->end_state = g->gc.state;
+  g->vmstate = ostate;
+  return res;
+}
+
+#endif
+
+/* OGSR: visit every userdata on the main GC list (debug, lua_gcforeachudata). */
+void lj_gc_foreach_udata(global_State *g, lua_UdataVisitor f, void *ctx)
+{
+  GCobj *o;
+  gc_udscan_rejoin(g);  /* Pre-scanned userdata aren't on the main list. */
+  for (o = gcref(g->gc.root); o != NULL; o = gcref(o->gch.nextgc))
+    if (o->gch.gct == ~LJ_TUDATA) {
+      GCudata *ud = gco2ud(o);
+      f(ctx, uddata(ud), ud->len, tabref(ud->metatable));
+    }
+}
+
 /* Perform a full GC cycle. */
 void lj_gc_fullgc(lua_State *L)
 {
@@ -784,6 +1028,7 @@ void lj_gc_fullgc(lua_State *L)
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
+    gc_udscan_rejoin(g);  /* OGSR: put back pre-scanned userdata. */
     setmref(g->gc.sweep, &g->gc.root);  /* Sweep everything (preserving it). */
     setgcrefnull(g->gc.gray);  /* Reset lists from partial propagation. */
     setgcrefnull(g->gc.grayagain);

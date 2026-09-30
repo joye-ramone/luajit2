@@ -616,6 +616,14 @@ typedef struct GCState {
 #if LJ_64
   MRef lightudseg;	/* Upper bits of lightuserdata segments. */
 #endif
+  /* OGSR: userdata pre-scan, time-budgeted GC and stats (see lj_gc.c). */
+  MRef udscan;		/* Pre-scan position in the main userdata list. */
+  GCRef udscanned;	/* Pre-scanned userdata, spliced back in the atomic phase. */
+  GCRef udscannedtail;	/* Last object of the pre-scanned list. */
+  uint8_t udscandone;	/* Userdata pre-scan finished for this cycle. */
+  uint64_t atomic_ns;	/* Duration of the last atomic phase (timed GC). */
+  uint64_t finalized_total;	/* Number of __gc calls (debug stats). */
+  lua_GCStats stats;	/* Stats of the last timed GC call. */
 } GCState;
 
 /* String interning state. */

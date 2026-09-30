@@ -28,6 +28,21 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
   return ud;
 }
 
+/* OGSR: userdata whose __gc is never called (lua_newuserdata_nogc). It's
+** moved to the main GC list, so the atomic phase doesn't walk it when
+** separating userdata to be finalized, and it's simply freed by the sweep.
+*/
+GCudata *lj_udata_new_nogc(lua_State *L, MSize sz, GCtab *env)
+{
+  GCudata *ud = lj_udata_new(L, sz, env);
+  global_State *g = G(L);
+  setgcrefr(mainthread(g)->nextgc, ud->nextgc);  /* Unchain from the userdata list, it's the head. */
+  setgcrefr(ud->nextgc, g->gc.root);  /* Chain to the main GC list, like any other new object. */
+  setgcref(g->gc.root, obj2gco(ud));
+  markfinalized(obj2gco(ud));  /* Never finalize it. */
+  return ud;
+}
+
 void LJ_FASTCALL lj_udata_free(global_State *g, GCudata *ud)
 {
   lj_mem_free(g, ud, sizeudata(ud));

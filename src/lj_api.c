@@ -1270,58 +1270,46 @@ LUA_API int lua_resume(lua_State *L, int nargs)
 
 /* -- GC and memory management -------------------------------------------- */
 
-#if LJ_TARGET_WINDOWS
-static uint64_t gc_get_ns(void)
-{
-  LARGE_INTEGER pf, pc;
-  uint64_t tv_sec, tv_nsec;
+/* -- OGSR extensions (see lua.h) ------------------------------------------ */
 
-  if (!QueryPerformanceFrequency(&pf) || !QueryPerformanceCounter(&pc))
-    return 0;
-
-  tv_sec = pc.QuadPart / pf.QuadPart;
-  tv_nsec = ((pc.QuadPart % pf.QuadPart) * 1000000000ULL + (pf.QuadPart >> 1)) / pf.QuadPart;
-
-  return 1000000000ULL * tv_sec + tv_nsec;
-}
-#elif LJ_TARGET_POSIX
-#include <time.h>
-
-static uint64_t gc_get_ns(void)
-{
-  struct timespec ts;
-
-#ifdef CLOCK_MONOTONIC_RAW
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-#else
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-#endif
-
-  return 1000000000ULL * ts.tv_sec + ts.tv_nsec;
-}
-#endif
-
+/* LUA_GCTIMEOUT: time-budgeted incremental GC, see lj_gc_step_timeout. */
 static int gc_step_timeout(lua_State *L, uint32_t timeout_usec)
 {
 #if LJ_TARGET_WINDOWS || LJ_TARGET_POSIX
-  int res = 0;
-  uint64_t timeout = timeout_usec * 1000;
-  uint64_t time_current = gc_get_ns();
-
-  timeout += time_current;
-  while (time_current < timeout) {
-    if (lj_gc_step(L) > 0) {
-      res = 1;
-      break;
-    }
-
-    time_current = gc_get_ns();
-  }
-  return res;
+  return lj_gc_step_timeout(L, (uint64_t)timeout_usec * 1000);
 #else
   return -1;
 #endif
 }
+
+LUA_API void *lua_newuserdata_nogc(lua_State *L, size_t size)
+{
+  GCudata *ud;
+  lj_gc_check(L);
+  if (size > LJ_MAX_UDATA)
+    lj_err_msg(L, LJ_ERR_UDATAOV);
+  ud = lj_udata_new_nogc(L, (MSize)size, getcurrenv(L));
+  setudataV(L, L->top, ud);
+  incr_top(L);
+  return uddata(ud);
+}
+
+LUA_API const lua_GCStats *lua_gcstats(lua_State *L)
+{
+  return &G(L)->gc.stats;
+}
+
+LUA_API unsigned long long lua_gcfinalizedtotal(lua_State *L)
+{
+  return G(L)->gc.finalized_total;
+}
+
+LUA_API void lua_gcforeachudata(lua_State *L, lua_UdataVisitor f, void *ctx)
+{
+  lj_gc_foreach_udata(G(L), f, ctx);
+}
+
+/* -- End of OGSR extensions ----------------------------------------------- */
 
 LUA_API int lua_gc(lua_State *L, int what, int data)
 {

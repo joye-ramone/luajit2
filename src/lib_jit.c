@@ -148,6 +148,28 @@ LJLIB_CF(jit_attach)
   return 0;
 }
 
+#if LJ_HASJIT
+/* OGSR: one 32-bit word of the PRNG state: an integer in 0 .. 2^32-1, or in
+** -2^31 .. -1 (its two's complement bits; states saved before this fix had
+** signed words). The upstream code converted with numberVint: words >= 2^31
+** saturated to INT_MIN and the sign extension corrupted the high word.
+*/
+static uint32_t jit_prngstate_word(lua_State *L, cTValue *o)
+{
+  lua_Number n;
+  if (!o)  /* a hole in the array part */
+    lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
+  if (tvisint(o))
+    return (uint32_t)intV(o);
+  if (!tvisnum(o))
+    lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
+  n = numV(o);
+  if (!(n >= -2147483648.0 && n <= 4294967295.0) || n != (lua_Number)(int64_t)n)
+    lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
+  return (uint32_t)(int64_t)n;
+}
+#endif
+
 LJLIB_CF(jit_prngstate)
 {
   GCtab *cur = lj_tab_new(L, 8, 0);
@@ -157,21 +179,17 @@ LJLIB_CF(jit_prngstate)
   jit_State *J = L2J(L);
 
   /* The old state. */
+  /* OGSR: unsigned words (setintV made words >= 2^31 negative, which the setter rejected). */
   for (i = 1; i <= 4; i++) {
-    setintV(lj_tab_setint(L, cur, i*2-1), J->prng.u[i-1] & 0xffffffff);
-    setintV(lj_tab_setint(L, cur, i*2), J->prng.u[i-1] >> 32);
+    setnumV(lj_tab_setint(L, cur, i*2-1), (lua_Number)(uint32_t)(J->prng.u[i-1] & 0xffffffff));
+    setnumV(lj_tab_setint(L, cur, i*2), (lua_Number)(uint32_t)(J->prng.u[i-1] >> 32));
   }
 
   /* We need to set new state using the input array. */
   if (L->base < L->top && !tvisnil(L->base)) {
     PRNGState prng;
     if (tvisnumber(L->base)) {
-      TValue *o = L->base;
-
-      if (!tvisint(o) && ((double)(uint32_t)numV(o) != numV(o)))
-        lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
-
-      prng.u[0] = numberVint(o);
+      prng.u[0] = jit_prngstate_word(L, L->base);  /* OGSR */
       for (i = 1; i < 4; i++)
         prng.u[i] = 0;
     } else {
@@ -183,15 +201,12 @@ LJLIB_CF(jit_prngstate)
         lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
 
       for (i = 1; i <= len; i++) {
-        cTValue *v = lj_tab_getint(t, i);
-
-        if (!tvisint(v) && (!tvisnum(v) || (double)(uint32_t)numV(v) != numV(v)))
-          lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
+        uint64_t w = jit_prngstate_word(L, lj_tab_getint(t, i));  /* OGSR */
 
         if (i & 1)
-          prng.u[(i-1)/2] = numberVint(v);
+          prng.u[(i-1)/2] = w;
         else
-          prng.u[(i-1)/2] = prng.u[(i-1)/2] | ((uint64_t)numberVint(v) << 32);
+          prng.u[(i-1)/2] |= w << 32;
       }
       for (i /= 2; i < 4; i++)
         prng.u[i] = 0;

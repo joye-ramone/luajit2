@@ -21,6 +21,12 @@ The GC atomic phase (not incremental) walked every userdata to find those to fin
 
 `GCState` gets new fields at its end (`udscan*`, `atomic_ns`, `finalized_total`, `stats`). The VM code only uses offsets of existing fields, which don't change.
 
+## Other fixes
+
+| Fix | Where | What |
+|---|---|---|
+| `jit.prngstate` round trip | `lib_jit.c` `jit_prngstate`, `jit_prngstate_word` | OpenResty's getter returned the 32-bit words as signed integers (`setintV`), which its setter rejected, and the setter converted words with `numberVint`: words >= 2^31 saturated to `INT_MIN` and the sign extension corrupted the high word (`{4000000000, 1}` read back as `{-2147483648, -1}`). Now the getter returns unsigned words, the setter takes integers in `-2^31 .. 2^32-1` (negative ones as their two's complement bits, so states saved by the old getter still work) and rejects anything else. Upstream lines changed here (exception to "only added to"), marked `OGSR`. Tested by the engine's autotest `tools/autotest/engine/luajit_openresty.script`. |
+
 ## Engine side (OGSR Engine repo)
 
 - `xrGame/Level.cpp` `CLevel::script_gc`: pacing (pause, budget from allocation rate, ramp up when behind), `[script_gc]` log of slow calls (`lua_gc_log_ms`).

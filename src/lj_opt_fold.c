@@ -180,7 +180,10 @@ LJFOLDF(kfold_numarith)
 {
   lua_Number a = knumleft;
   lua_Number b = knumright;
-  lua_Number y = lj_vm_foldarith(a, b, fins->o - IR_ADD);
+  lua_Number y;
+  if (fins->o == IR_LDEXP && !lj_num2int_ok(b))
+    return NEXTFOLD;
+  y = lj_vm_foldarith(a, b, fins->o - IR_ADD);
   return lj_ir_knum(J, y);
 }
 
@@ -2368,8 +2371,18 @@ LJFOLD(FLOAD CNEWI IRFL_CDATA_INT)
 LJFOLD(FLOAD CNEWI IRFL_CDATA_INT64)
 LJFOLDF(fload_cdata_ptr_int64_cnew)
 {
-  if (LJ_LIKELY(J->flags & JIT_F_OPT_FOLD))
-    return fleft->op2;  /* Fold even across PHI to avoid allocations. */
+  /* Fold even across PHI to avoid allocations. */
+  if (LJ_LIKELY(J->flags & JIT_F_OPT_FOLD)) {
+    IRRef ref = fleft->op2;
+    IRType1 st = IR(ref)->t, dt = fins->t;
+    if (fins->op2 == IRFL_CDATA_PTR || irt_sametype(st, dt))
+      return ref;
+    /* Add I32/U32 or I64/U64 conversion to preserve the destination type. */
+    fins->o = IR_CONV;
+    fins->op1 = ref;
+    fins->op2 = (irt_type(dt)<<5)|irt_type(st);
+    return RETRYFOLD;
+  }
   return NEXTFOLD;
 }
 

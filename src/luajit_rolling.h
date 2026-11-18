@@ -74,6 +74,10 @@ LUA_API void luaJIT_profile_start(lua_State *L, const char *mode,
 LUA_API void luaJIT_profile_stop(lua_State *L);
 LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 					     int depth, size_t *len);
+/* OGSR: with mode 'x' in luaJIT_profile_start no timer runs; the host
+** requests each sample (from any thread), as the timer would. Returns 1
+** while the profiler of this VM runs. */
+LUA_API int luaJIT_profile_request(lua_State *L);
 
 /* Enforce (dynamic) linker error for version mismatches. Call from main. */
 LUA_API void LUAJIT_VERSION_SYM(void);

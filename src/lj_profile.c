@@ -63,6 +63,7 @@ typedef struct ProfileState {
   int interval;			/* Sample interval in milliseconds. */
   int samples;			/* Number of samples for next callback. */
   int vmstate;			/* VM state when profile timer triggered. */
+  int external;			/* OGSR: mode 'x', samples requested by the host. */
 #if LJ_PROFILE_SIGPROF
   struct sigaction oldsa;	/* Previous SIGPROF state. */
 #elif LJ_PROFILE_PTHREAD
@@ -285,6 +286,12 @@ static DWORD WINAPI profile_thread(void *psx)
 /* Start profiling timer thread. */
 static void profile_timer_start(ProfileState *ps)
 {
+  if (ps->external) {  /* OGSR: the host requests samples, no thread. */
+    InitializeCriticalSection(&ps->lock);
+    ps->abort = 0;
+    ps->thread = NULL;
+    return;
+  }
 #if LJ_TARGET_WINDOWS && !LJ_TARGET_UWP
   if (!ps->wmm) {  /* Load WinMM library on-demand. */
     ps->wmm = LJ_WIN_LOADLIBA("winmm.dll");
@@ -307,7 +314,8 @@ static void profile_timer_start(ProfileState *ps)
 static void profile_timer_stop(ProfileState *ps)
 {
   ps->abort = 1;
-  WaitForSingleObject(ps->thread, INFINITE);
+  if (ps->thread)  /* OGSR: no thread in mode 'x'. */
+    WaitForSingleObject(ps->thread, INFINITE);
   DeleteCriticalSection(&ps->lock);
 }
 
@@ -321,9 +329,15 @@ LUA_API void luaJIT_profile_start(lua_State *L, const char *mode,
 {
   ProfileState *ps = &profile_state;
   int interval = LJ_PROFILE_INTERVAL_DEFAULT;
+  int external = 0;
   while (*mode) {
     int m = *mode++;
     switch (m) {
+#if LJ_PROFILE_WTHREAD
+    case 'x':  /* OGSR: no timer, luaJIT_profile_request() triggers. */
+      external = 1;
+      break;
+#endif
     case 'i':
       interval = 0;
       while (*mode >= '0' && *mode <= '9')
@@ -349,8 +363,19 @@ LUA_API void luaJIT_profile_start(lua_State *L, const char *mode,
   ps->cb = cb;
   ps->data = data;
   ps->samples = 0;
+  ps->external = external;
   lj_buf_init(L, &ps->sb);
   profile_timer_start(ps);
+}
+
+/* OGSR: request one sample, as the timer thread does (any thread). The
+** host must not call it after luaJIT_profile_stop() started. */
+LUA_API int luaJIT_profile_request(lua_State *L)
+{
+  ProfileState *ps = &profile_state;
+  if (ps->g != G(L)) return 0;
+  profile_trigger(ps);
+  return 1;
 }
 
 /* Stop profiling. */

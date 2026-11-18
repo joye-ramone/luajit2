@@ -78,6 +78,11 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** requests each sample (from any thread), as the timer would. Returns 1
 ** while the profiler of this VM runs. */
 LUA_API int luaJIT_profile_request(lua_State *L);
+/* OGSR: helpers for trace events (jit.attach(f, "trace")) without jit.vmdef:
+** the text of an abort reason (pushed, returned), and the line of bytecode pc
+** in a Lua function (-1: none) with whether trace starts there are blacklisted. */
+LUA_API const char *luaJIT_trace_errmsg(lua_State *L, int erridx, int infoidx);
+LUA_API int luaJIT_func_pcinfo(lua_State *L, int idx, int pc, int *blacklisted);
 
 /* Enforce (dynamic) linker error for version mismatches. Call from main. */
 LUA_API void LUAJIT_VERSION_SYM(void);
